@@ -1,7 +1,7 @@
 import axios from 'axios';
 
 const api = axios.create({
-  baseURL: 'http://localhost:9000/api',
+  baseURL: 'https://filmybowl-gemini-project.onrender.com/api',
   timeout: 60000,
 });
 
