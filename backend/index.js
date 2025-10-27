@@ -15,7 +15,7 @@ app.use(express.json());
 
 // ---------------- Config ----------------
 const PORT = 9000;
-const MONGO_URI = "mongodb://127.0.0.1:27017/FilmyBowl";
+const MONGO_URI = "mongodb+srv://visheshj865:Vishesh6609@cluster0.bw0bufi.mongodb.net/";
 const LIST_URL = "https://tracktollywood.com/category/movie-news/";
 
 // Pacing & limits
@@ -33,7 +33,7 @@ const GEMINI_ENDPOINT = (model, key) =>
 
 // ZeroGPT (optional)—leave blank to skip scoring
 const ZEROGPT_API_URL = "https://api.zerogpt.com/api/detect/detectText";
-const ZEROGPT_API_KEY = ""; // put your key here, or leave '' to skip
+const ZEROGPT_API_KEY = "0f23f165-dafe-4b95-a28f-7b5182a790d1"; // put your key here, or leave '' to skip
 
 // Humanizer service (your FastAPI on Render)
 const HUMANIZER_BASE = "https://aitext-to-humantext-convertor.onrender.com";
