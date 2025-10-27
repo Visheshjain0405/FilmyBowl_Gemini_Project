@@ -1,6 +1,6 @@
 // server.js
 // Scrape → (if <500w) rewrite with Gemini → humanize via FastAPI → upload image to Cloudinary → save all + scores
-// Sequential with configurable delay; token usage & AI score storage; no .env used.
+// Now: scheduled every 1 hour, overlap-safe, with manual trigger + status.
 
 import express from "express";
 import axios from "axios";
@@ -8,6 +8,7 @@ import * as cheerio from "cheerio";
 import mongoose from "mongoose";
 import cors from "cors";
 import { v2 as cloudinary } from "cloudinary";
+import cron from "node-cron";
 
 const app = express();
 app.use(cors({ origin: true }));
@@ -15,13 +16,20 @@ app.use(express.json());
 
 // ---------------- Config ----------------
 const PORT = 9000;
-const MONGO_URI = "mongodb+srv://visheshj865:Vishesh6609@cluster0.bw0bufi.mongodb.net/";
+const MONGO_URI = "mongodb+srv://visheshj865:Vishesh6609@cluster0.bw0bufi.mongodb.net/FilmyBowl";
 const LIST_URL = "https://tracktollywood.com/category/movie-news/";
 
 // Pacing & limits
-const BETWEEN_ITEMS_DELAY_MS = 30_000; // 30s (change as you like)
+const BETWEEN_ITEMS_DELAY_MS = 30_000; // 30s
 const STARTUP_MAX_ITEMS = 10;
 const REWRITE_IF_ORIGINAL_LT_WORDS = 500;
+
+// Scheduling
+// "0 * * * *" ⇒ every hour at minute 0 (e.g., 09:00, 10:00...)
+// You can override with env CRON_EXPRESSION
+const CRON_EXPRESSION = process.env.CRON_EXPRESSION || "0 * * * *";
+const SCRAPE_ON_START = process.env.SCRAPE_ON_START !== "false"; // default true
+const HOURLY_MAX_ITEMS = Number(process.env.HOURLY_MAX_ITEMS || 12);
 
 // Gemini (direct; v1beta generateContent)
 const GEMINI_API_KEY = "AIzaSyDlV0gjKvJF3Xf8ShYrEyScNMCLnyEAAKM";
@@ -66,17 +74,10 @@ const ArticleSchema = new mongoose.Schema(
     link: { type: String, unique: true, index: true },
     author: String,
     date: Date,
-
-    // listing thumb (source trace)
     thumbnail: String,
-
-    // best image found on article page (source trace)
     imageSourceUrl: String,
-
-    // Cloudinary
     imageCdnUrl: String,
     imagePublicId: String,
-
     content: String,
   },
   { timestamps: true }
@@ -89,21 +90,16 @@ const RewriteArticleSchema = new mongoose.Schema(
     sourceLink: String,
     sourceAuthor: String,
     sourceDate: Date,
-
     title: String,        // rewritten H1 title
     content: String,      // Markdown
     model: String,
-
-    // carry over image
     imageCdnUrl: String,
     imagePublicId: String,
-
-    // metrics
     wordCount: Number,
     promptTokens: Number,
     completionTokens: Number,
     totalTokens: Number,
-    aiScore: Number,      // AI score of rewritten text
+    aiScore: Number,
   },
   { timestamps: true }
 );
@@ -112,27 +108,17 @@ const HumanizeArticleSchema = new mongoose.Schema(
   {
     articleId: { type: mongoose.Schema.Types.ObjectId, ref: "Article", index: true },
     rewriteId: { type: mongoose.Schema.Types.ObjectId, ref: "RewriteArticle", index: true },
-
     sourceTitle: String,
     sourceLink: String,
-
-    // Input (rewritten)
     inputText: String,
     inputWordCount: Number,
     inputSentenceCount: Number,
-
-    // Output (humanized)
     humanizedText: String,
     outputWordCount: Number,
     outputSentenceCount: Number,
-
     readabilityImprovement: Number,
     settings: Object,
-
-    // AI score for humanized text
     aiScore: Number,
-
-    // convenience: carry image too
     imageCdnUrl: String,
     imagePublicId: String,
   },
@@ -172,7 +158,6 @@ async function fetchFullArticleAndImage(link) {
     });
     const $ = cheerio.load(data);
 
-    // Content
     const chunks = [];
     $(".td-post-content p").each((i, el) => {
       const t = $(el).text().trim();
@@ -180,7 +165,6 @@ async function fetchFullArticleAndImage(link) {
     });
     const text = chunks.join("\n\n");
 
-    // Best image: og:image > twitter:image > featured > first in content
     const og = $('meta[property="og:image"]').attr("content")?.trim();
     const tw = $('meta[name="twitter:image"]').attr("content")?.trim();
     const featured =
@@ -269,8 +253,7 @@ async function rewriteWithGemini(topic, sourceText) {
   const usage = data?.usageMetadata || {};
   const promptTokens = Number(usage.promptTokenCount || 0);
   const completionTokens = Number(usage.candidatesTokenCount || 0);
-  const totalTokens =
-    Number(usage.totalTokenCount || promptTokens + completionTokens);
+  const totalTokens = Number(usage.totalTokenCount || promptTokens + completionTokens);
 
   return { markdown: text, promptTokens, completionTokens, totalTokens };
 }
@@ -389,7 +372,7 @@ async function scrapeAndRewriteSequential({
     if (exists) {
       skipped++;
       console.log(`⏭️  Skipped (already exists): ${title}`);
-      console.log(`⏳ Waiting ${delayMs / 1000}s before next...`);
+      console.log(`⏳ Waiting ${Math.round(delayMs / 1000)}s before next...`);
       await sleep(delayMs);
       continue;
     }
@@ -398,12 +381,10 @@ async function scrapeAndRewriteSequential({
     const { text: content, bestImage } = await fetchFullArticleAndImage(link);
     const originalWordCount = countWords(content);
 
-    // Image choose + upload to Cloudinary
     const chosenImageSource = bestImage || thumb || "";
     const { secure_url: cdnUrl, public_id: publicId } =
       await uploadRemoteImageToCloudinary(chosenImageSource);
 
-    // Save original article
     const saved = await Article.create({
       title,
       link,
@@ -417,7 +398,6 @@ async function scrapeAndRewriteSequential({
     });
     inserted++;
 
-    // ---- Rewrite only if original < threshold ----
     let rewriteDoc = null;
     if (originalWordCount < REWRITE_IF_ORIGINAL_LT_WORDS) {
       try {
@@ -441,7 +421,6 @@ async function scrapeAndRewriteSequential({
             content: markdown,
             model: GEMINI_MODEL,
 
-            // carry image
             imageCdnUrl: saved.imageCdnUrl || "",
             imagePublicId: saved.imagePublicId || "",
 
@@ -459,7 +438,6 @@ async function scrapeAndRewriteSequential({
           `✍️  Rewritten: ${newTitle} (**${wordCount}** words | tokens: prompt=${promptTokens}, completion=${completionTokens}, total=${totalTokens} | AI score=${aiScore}%)`
         );
 
-        // ---- HUMANIZE the rewritten article via FastAPI ----
         try {
           const h = await humanizeNewsRobust(markdown);
           const humanAI = await detectAIContent(h.humanizedText);
@@ -485,7 +463,6 @@ async function scrapeAndRewriteSequential({
 
               aiScore: humanAI,
 
-              // carry image for convenience
               imageCdnUrl: saved.imageCdnUrl || "",
               imagePublicId: saved.imagePublicId || "",
             },
@@ -508,7 +485,7 @@ async function scrapeAndRewriteSequential({
       );
     }
 
-    console.log(`⏳ Waiting ${delayMs / 1000}s before next...`);
+    console.log(`⏳ Waiting ${Math.round(delayMs / 1000)}s before next...`);
     await sleep(delayMs);
   }
 
@@ -518,6 +495,47 @@ async function scrapeAndRewriteSequential({
   return { inserted, skipped, rewrites, humanized };
 }
 
+// ---------------- Scheduler (overlap-safe) ----------------
+let isRunning = false;
+let lastRun = null;
+
+async function runScrapeJob({ reason = "scheduled", maxItems = HOURLY_MAX_ITEMS } = {}) {
+  if (isRunning) {
+    console.log(`⛔ Scrape already running, skipping (${reason})`);
+    return { running: true, skipped: true };
+  }
+  isRunning = true;
+  const startedAt = new Date();
+  console.log(`🕒 Starting scrape job (${reason}) @ ${startedAt.toISOString()}`);
+
+  let outcome = {};
+  try {
+    outcome = await scrapeAndRewriteSequential({
+      listUrl: LIST_URL,
+      maxItems,
+      delayMs: BETWEEN_ITEMS_DELAY_MS,
+    });
+  } catch (e) {
+    console.error("Scrape job error:", e.message);
+    outcome.error = e.message;
+  } finally {
+    const finishedAt = new Date();
+    isRunning = false;
+    lastRun = {
+      reason,
+      startedAt,
+      finishedAt,
+      durationSec: Math.round((finishedAt - startedAt) / 1000),
+      ...outcome,
+    };
+    console.log(
+      `🏁 Scrape job finished (${reason}). Duration: ${lastRun.durationSec}s`,
+    );
+  }
+
+  return { running: false, ...lastRun };
+}
+
 // ---------------- Endpoints ----------------
 app.get("/api/articles/latest", async (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
@@ -525,7 +543,6 @@ app.get("/api/articles/latest", async (req, res) => {
   res.json(rows);
 });
 
-// Get one article by id
 app.get("/api/articles/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -537,31 +554,24 @@ app.get("/api/articles/:id", async (req, res) => {
   }
 });
 
-
 app.get("/api/rewritearticles/latest", async (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
   const rows = await RewriteArticle.find().sort({ createdAt: -1 }).limit(limit);
   res.json(rows);
 });
 
-// Get ONE rewritten article (with optional original fields for convenience)
 app.get("/api/rewritearticles/:id", async (req, res) => {
   try {
     const { id } = req.params;
-
     const rewrite = await RewriteArticle.findById(id).lean();
     if (!rewrite) return res.status(404).json({ error: "Rewrite not found" });
 
-    // (Optional) also send back original Article for extra context / fallback
     const article = await Article.findById(rewrite.articleId).lean();
-
-    // Prefer image saved on rewrite; fallback to original article's image
     const imageCdnUrl = rewrite.imageCdnUrl || article?.imageCdnUrl || "";
     const imagePublicId = rewrite.imagePublicId || article?.imagePublicId || "";
 
     res.json({
       ...rewrite,
-      // add convenience fields for the view
       imageCdnUrl,
       imagePublicId,
       source: {
@@ -576,107 +586,26 @@ app.get("/api/rewritearticles/:id", async (req, res) => {
   }
 });
 
-
 app.get("/api/humanizearticles/latest", async (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
   const rows = await HumanizeArticle.find().sort({ createdAt: -1 }).limit(limit);
   res.json(rows);
 });
 
-// Regenerate rewrite (and humanize) for a given Article ID
-app.post("/api/rewrite/:articleId", async (req, res) => {
-  try {
-    const { articleId } = req.params;
-    const art = await Article.findById(articleId);
-    if (!art) return res.status(404).json({ error: "Article not found" });
+// ---- New: Scheduler endpoints ----
+app.get("/api/scrape/run", async (req, res) => {
+  const maxItems = parseInt(req.query.maxItems) || HOURLY_MAX_ITEMS;
+  const result = await runScrapeJob({ reason: "manual", maxItems });
+  res.json(result);
+});
 
-    // rewrite
-    const { markdown, promptTokens, completionTokens, totalTokens } =
-      await rewriteWithGemini(art.title, art.content);
-
-    const newTitle = extractTitle(markdown) || art.title;
-    const wordCount = countWords(markdown);
-    const aiScore = await detectAIContent(markdown);
-
-    const rewriteDoc = await RewriteArticle.findOneAndUpdate(
-      { articleId: art._id },
-      {
-        articleId: art._id,
-        sourceTitle: art.title,
-        sourceLink: art.link,
-        sourceAuthor: art.author,
-        sourceDate: art.date,
-
-        title: newTitle,
-        content: markdown,
-        model: GEMINI_MODEL,
-
-        // carry image from Article
-        imageCdnUrl: art.imageCdnUrl || "",
-        imagePublicId: art.imagePublicId || "",
-
-        wordCount,
-        promptTokens,
-        completionTokens,
-        totalTokens,
-        aiScore,
-      },
-      { upsert: true, new: true }
-    );
-
-    console.log(
-      `♻️  Regenerated: ${newTitle} (**${wordCount}** words | tokens: prompt=${promptTokens}, completion=${completionTokens}, total=${totalTokens} | AI score=${aiScore}%)`
-    );
-
-    // humanize regenerated
-    let hSaved = null;
-    try {
-      const h = await humanizeNewsRobust(markdown);
-      const humanAI = await detectAIContent(h.humanizedText);
-
-      hSaved = await HumanizeArticle.findOneAndUpdate(
-        { articleId: art._id, rewriteId: rewriteDoc._id },
-        {
-          articleId: art._id,
-          rewriteId: rewriteDoc._id,
-
-          sourceTitle: art.title,
-          sourceLink: art.link,
-
-          inputText: h.originalText,
-          inputWordCount: h.inputWordCount,
-          inputSentenceCount: h.inputSentenceCount,
-
-          humanizedText: h.humanizedText,
-          outputWordCount: h.outputWordCount,
-          outputSentenceCount: h.outputSentenceCount,
-          readabilityImprovement: h.readabilityImprovement,
-          settings: h.settings,
-
-          aiScore: humanAI,
-
-          // carry image from Article
-          imageCdnUrl: art.imageCdnUrl || "",
-          imagePublicId: art.imagePublicId || "",
-        },
-        { upsert: true, new: true }
-      );
-
-      console.log(
-        `🧑‍💻 Re-Humanized: (**${h.outputWordCount}** words | AI score=${humanAI}% | Δreadability=${h.readabilityImprovement}%)`
-      );
-    } catch (e) {
-      console.error(`Humanize (regenerate) failed: ${e.message}`);
-    }
-
-    res.json({
-      message: "Regenerated rewrite & humanize",
-      rewrite: rewriteDoc,
-      humanize: hSaved,
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+app.get("/api/scrape/status", async (_req, res) => {
+  res.json({
+    isRunning,
+    lastRun: lastRun || null,
+    schedule: CRON_EXPRESSION,
+    defaultHourlyMaxItems: HOURLY_MAX_ITEMS,
+  });
 });
 
 // ---------------- Boot ----------------
@@ -687,18 +616,41 @@ app.post("/api/rewrite/:articleId", async (req, res) => {
 
     app.listen(PORT, async () => {
       console.log(`🚀 Server running at http://localhost:${PORT}`);
-      try {
-        await scrapeAndRewriteSequential({
-          listUrl: LIST_URL,
-          maxItems: STARTUP_MAX_ITEMS,
-          delayMs: BETWEEN_ITEMS_DELAY_MS,
-        });
-      } catch (e) {
-        console.error("Startup scrape failed:", e.message);
+
+      // initial scrape on boot (optional)
+      if (SCRAPE_ON_START) {
+        try {
+          await runScrapeJob({ reason: "startup", maxItems: STARTUP_MAX_ITEMS });
+        } catch (e) {
+          console.error("Startup scrape failed:", e.message);
+        }
       }
+
+      // cron schedule (every hour)
+      cron.schedule(
+        CRON_EXPRESSION,
+        async () => {
+          await runScrapeJob({ reason: "scheduled", maxItems: HOURLY_MAX_ITEMS });
+        },
+        {
+          scheduled: true,
+          timezone: "Asia/Kolkata", // match your TZ
+        }
+      );
+
+      console.log(
+        `⏱️  Cron scheduled: "${CRON_EXPRESSION}" (Asia/Kolkata). Manual: GET /api/scrape/run`
+      );
     });
   } catch (err) {
     console.error("MongoDB connection error:", err);
     process.exit(1);
   }
 })();
+
+// ---- Graceful shutdown ----
+process.on("SIGINT", async () => {
+  console.log("🧹 Shutting down...");
+  await mongoose.disconnect();
+  process.exit(0);
+});
